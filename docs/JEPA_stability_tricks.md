@@ -10,6 +10,23 @@ Summary of practices and tricks to keep JEPA training stable and avoid represent
 - Risk: the predictor can drive the online encoder toward outputs that are easy to predict (e.g. constant or low-rank), giving low loss but **collapsed** representations.
 - EMA alone is often **not enough** to prevent full collapse; the target can still track the student into a collapsed regime.
 
+### 1.1 How “training collapse” happens mechanistically
+
+I-JEPA’s main collapse avoidance is **asymmetry**:
+
+- **Context (“student”) encoder**: trained by **gradient** (loss → z_pred → predictor → z_c → online encoder).
+- **Target (“teacher”) encoder**: updated only by **EMA** of the student, and **stop-gradient** on the target branch (target is a fixed label for this step).
+
+If you break that asymmetry, the system can **chase itself** into the constant-vector shortcut:
+
+1. **No stop-grad on target**: If the target branch is inside the autograd graph, gradients flow into the target encoder. Then both encoders get the same pressure (“match each other”). The easiest way to match is for both to output the same constant; gradients can then push both toward that constant. So **always** compute z_t_target under `torch.no_grad()` (or `.detach()`), and **never** put target encoder parameters in the optimizer.
+
+2. **Updating both encoders by backprop**: If both online and “target” are in the optimizer and receive gradients from the same loss, they co-adapt: the loss is minimized when z_pred ≈ z_t, which is trivially achieved by making both encoders output a constant. So the target must be **EMA-only**, not updated by gradient.
+
+3. **EMA momentum misconfigured**: If the teacher (EMA) changes **too fast** (e.g. momentum too low, so teacher ≈ student every step), the target tracks the student almost exactly. Then the predictor’s job is easy: “predict what the student will output,” and again the shortcut is for the student to output a constant so the predictor can match it. So use a **slow** EMA (e.g. momentum 0.996–0.999) so the target is a stable, lagging copy of the student.
+
+**Summary**: Keep (a) **stop-grad** on the target branch, (b) **target encoder not in the optimizer** (updated only by `copy_ema`), and (c) **slow EMA** so the teacher doesn’t chase the student into collapse.
+
 ---
 
 ## 2. Anti-collapse mechanisms
@@ -56,9 +73,16 @@ Summary of practices and tricks to keep JEPA training stable and avoid represent
 
 ## 3. Practical checklist for our setup
 
+**Target encoder gradient check (our notebook):**
+
+- **Stop-grad:** The entire target branch is computed inside `with torch.no_grad():` (full_input/residual_ema → model_ema, fourier_ema → phi_t_raw → semantic_head_ema → z_t_target). So no graph is built for the target; gradients never flow into `model_ema`, `fourier_ema`, or `semantic_head_ema`.
+- **Target not in optimizer:** `params = [model, fourier_encoder, semantic_head, predictor, mask_rgb]` only; `model_ema`, `fourier_ema`, `semantic_head_ema` are **not** in the optimizer. They are updated only by `copy_ema(..., current_momentum)` after each `optimizer.step()`.
+- **EMA update:** `copy_ema` uses `p_t.data.mul_(momentum).add_(p_s.data, alpha=1-momentum)` (in-place on `.data` only), so no gradients involved.
+
 | Trick | Our JEPA notebook | Recommendation |
 |-------|--------------------|----------------|
-| EMA target | ✅ `model_ema`, `copy_ema` | Keep; consider momentum schedule (ramp) |
+| EMA target + stop-grad | ✅ `no_grad` on target branch; EMA not in optimizer | Keep; do not remove no_grad or add EMA to optimizer |
+| EMA momentum | ✅ `copy_ema`, ramp 0.996→0.999 | Keep slow teacher |
 | Predict in φ (latent) | ✅ JEPA loss on z_pred vs z_t_target | Keep |
 | Mask: large target blocks | ✅ `PRED_MASK_SCALE=(0.15, 0.25)`, block masking | Keep; avoid very small target regions |
 | Mask: informative context | ✅ `ENC_MASK_SCALE=(0.85, 1.0)`, complement of target | Keep |
